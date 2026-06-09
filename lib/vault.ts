@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync, statSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync } from 'fs'
 import { join, dirname, resolve } from 'path'
 import { execFileSync } from 'child_process'
 
@@ -74,6 +74,18 @@ export function searchVault(query: string): string {
   } catch {
     return 'No results found for: ' + query
   }
+}
+
+export function moveFile(fromPath: string, toPath: string): string {
+  const from = safePath(fromPath)
+  const to = safePath(toPath)
+  if (!existsSync(from)) return `Source not found: ${fromPath}`
+  mkdirSync(dirname(to), { recursive: true })
+  const content = readFileSync(from, 'utf8')
+  writeFileSync(to, content, 'utf8')
+  // Remove old file (git will track as rename on commit)
+  execFileSync('rm', [from])
+  return `Moved: ${fromPath} → ${toPath}`
 }
 
 export function commitAndPush(message: string): string {

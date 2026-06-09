@@ -1,9 +1,8 @@
 import { NextRequest } from 'next/server'
 import Anthropic from '@anthropic-ai/sdk'
-import { readFile, listDirectory, getVaultStructure, searchVault, writeFile, VAULT_PATH } from '@/lib/vault'
+import { readFile, listDirectory, getVaultStructure, searchVault, writeFile, moveFile, VAULT_PATH } from '@/lib/vault'
+import { scrapeWebpage } from '@/lib/scraper'
 import { existsSync } from 'fs'
-
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 const TRAIN_SYSTEM = `You are BrainDump, an intelligent knowledge organizer for the Monument Traders Alliance brain vault.
 
@@ -21,33 +20,50 @@ The vault is an Obsidian-format knowledge base using the PARA system:
 
 Key people: Bryan Bottarelli (WAR/PMK/WNM/TPU), Karim Rahemtulla (WAR/TPU), Nate Bear (PSU/DPL/DPS/NBS), Chris Johnson (MTLIV host), Stephen Prior (Publisher), Ryan Fitzwater (CEO)
 
-When the user provides information:
-1. Use list_directory and get_vault_structure to understand where things belong
-2. Read existing files before updating them (use read_file)
-3. Determine the correct vault location — be specific about WHY you chose it
-4. Use write_file to stage the change — explain what you're writing and where
-5. If the info updates industry relationships or publisher/guru connections, also update Resources/Financial Publishing Knowledge Graph.md
-6. If the info is MTA-specific (publications, promos, gurus, strategy), explicitly ask: "This looks MTA-related — would you like me to also update the MTA Wiki?"
-7. After staging all files, summarize exactly what you've written and ask the user to confirm before it's saved
+## Your behavior in Train Mode
 
-Important: Stage ALL related files before asking for confirmation. Never commit automatically — always wait for user confirmation.`
+**Step 1 — Ask clarifying questions first.**
+Before doing anything, ask 2-4 focused questions to get the full picture. Examples:
+- What is the start date / timeline?
+- What products or services are involved?
+- Is this confirmed or speculative?
+- Any context on why this matters for MTA?
+- Do you have more details on X?
+
+Keep questions short and numbered. Wait for the user's answers before proceeding.
+
+**Step 2 — Research the vault silently.**
+Once you have enough information, use tools to check existing files and understand where this belongs. Do this in the background — don't narrate every tool call.
+
+**Step 3 — Present a clear save plan.**
+Summarize exactly what you plan to write in a clean, readable format:
+
+"Here's what I'll save to the brain:
+
+📄 **Areas/MTA/People/Matt McCall.md** — New guru profile
+📄 **Resources/Financial Publishing Knowledge Graph.md** — Add Matt McCall node under MTA
+
+This is MTA-related — would you also like me to update the MTA Wiki?"
+
+Then ask: "Ready to save, or would you like to change anything?"
+
+**Step 4 — Stage files only after confirmation.**
+Use write_file only after the user says yes. Never stage without explicit approval.
+
+Never commit automatically. Always wait for the user to click "Save to Brain".`
 
 const DISCOVER_SYSTEM = `You are BrainDump in Discover mode — a knowledge retrieval assistant for the MTA brain vault.
 
-Your job: find and synthesize information from the vault to answer questions accurately.
-
-Always:
-- Use search_vault to find relevant content before answering
-- Read the actual files with read_file before quoting them
-- Cite the exact file paths you used (e.g. "From Resources/Nate Bear - Claims & Track Record.md:")
-- If you can't find something, say so clearly and suggest where it might be stored
-
-Never write or modify any files in discover mode.`
+Find and synthesize information from the vault to answer questions accurately.
+- Use search_vault to find relevant content
+- Read actual files with read_file before quoting
+- Always cite exact file paths you used
+- Never write or modify files in discover mode`
 
 const TRAIN_TOOLS: Anthropic.Tool[] = [
   {
     name: 'get_vault_structure',
-    description: 'Get the top-level folder structure of the brain vault. Use this first to understand where things belong.',
+    description: 'Get the top-level folder structure of the brain vault.',
     input_schema: { type: 'object' as const, properties: {} }
   },
   {
@@ -55,7 +71,7 @@ const TRAIN_TOOLS: Anthropic.Tool[] = [
     description: 'List the contents of a specific vault directory.',
     input_schema: {
       type: 'object' as const,
-      properties: { path: { type: 'string', description: 'Relative path within vault, e.g. "Resources/Promos"' } },
+      properties: { path: { type: 'string' } },
       required: ['path']
     }
   },
@@ -64,7 +80,7 @@ const TRAIN_TOOLS: Anthropic.Tool[] = [
     description: 'Read an existing vault file. Always read before updating.',
     input_schema: {
       type: 'object' as const,
-      properties: { path: { type: 'string', description: 'Relative path, e.g. "Resources/Nate Bear - Claims & Track Record.md"' } },
+      properties: { path: { type: 'string' } },
       required: ['path']
     }
   },
@@ -73,81 +89,124 @@ const TRAIN_TOOLS: Anthropic.Tool[] = [
     description: 'Search for text across all markdown files in the vault.',
     input_schema: {
       type: 'object' as const,
-      properties: { query: { type: 'string', description: 'Search term' } },
+      properties: { query: { type: 'string' } },
       required: ['query']
     }
   },
   {
     name: 'write_file',
-    description: 'Stage a file write to the vault. This does NOT immediately save — the user must confirm. Always explain why you chose this location.',
+    description: 'Stage a file write to the vault (does NOT save until user confirms). Explain why you chose this location.',
     input_schema: {
       type: 'object' as const,
       properties: {
-        path: { type: 'string', description: 'Relative path in vault where file should be written' },
-        content: { type: 'string', description: 'Full file content to write' },
+        path: { type: 'string', description: 'Relative path in vault' },
+        content: { type: 'string', description: 'Full file content' },
         reason: { type: 'string', description: 'Why this location was chosen' }
       },
       required: ['path', 'content', 'reason']
     }
+  },
+  {
+    name: 'move_file',
+    description: 'Move or rename a file within the vault. Stages the move — user must still confirm before committing.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        from: { type: 'string', description: 'Current relative path' },
+        to: { type: 'string', description: 'New relative path' },
+        reason: { type: 'string', description: 'Why this move is being made' }
+      },
+      required: ['from', 'to', 'reason']
+    }
+  },
+  {
+    name: 'scrape_webpage',
+    description: 'Fetch and read the content of a webpage. Use when the user shares a URL or asks you to "check out", "scrape", "read", or "learn from" a webpage.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        url: { type: 'string', description: 'Full URL including https://' }
+      },
+      required: ['url']
+    }
   }
 ]
 
-const DISCOVER_TOOLS: Anthropic.Tool[] = TRAIN_TOOLS.filter(t => t.name !== 'write_file')
+const DISCOVER_TOOLS = TRAIN_TOOLS.filter(t => t.name !== 'write_file')
 
 type StagedFile = { path: string; content: string; reason: string }
 
-function executeTool(name: string, input: Record<string, string>, staged: StagedFile[]): string {
-  switch (name) {
-    case 'get_vault_structure': return existsSync(VAULT_PATH) ? getVaultStructure() : 'Vault not yet synced. BRAIN_REPO_URL may not be set.'
-    case 'list_directory': return listDirectory(input.path)
-    case 'read_file': return readFile(input.path)
-    case 'search_vault': return searchVault(input.query)
-    case 'write_file':
-      staged.push({ path: input.path, content: input.content, reason: input.reason })
-      return `✅ Staged: "${input.path}" — ${input.reason}`
-    default: return `Unknown tool: ${name}`
+async function executeTool(name: string, input: Record<string, string>, staged: StagedFile[]): Promise<string> {
+  try {
+    switch (name) {
+      case 'get_vault_structure':
+        return existsSync(VAULT_PATH) ? getVaultStructure() : 'Vault not synced yet.'
+      case 'list_directory': return listDirectory(input.path)
+      case 'read_file': return readFile(input.path)
+      case 'search_vault': return searchVault(input.query)
+      case 'write_file':
+        staged.push({ path: input.path, content: input.content, reason: input.reason })
+        return `Staged: ${input.path}`
+      case 'move_file': {
+        // Stage a move: read content from source and stage write to destination
+        const content = readFile(input.from)
+        staged.push({ path: input.to, content, reason: `Moved from ${input.from}: ${input.reason}` })
+        // Mark old path for deletion by staging a tombstone
+        staged.push({ path: `__delete__:${input.from}`, content: '', reason: 'delete original after move' })
+        return `Staged move: ${input.from} → ${input.to}`
+      }
+      case 'scrape_webpage':
+        return await scrapeWebpage(input.url)
+      default: return `Unknown tool: ${name}`
+    }
+  } catch (e) {
+    return `Tool error: ${e instanceof Error ? e.message : String(e)}`
   }
 }
 
 export async function POST(req: NextRequest) {
+  const client = new Anthropic({ apiKey: process.env.BRAINDUMP_API_KEY })
   const body = await req.json()
   const { messages, mode = 'train', imageData } = body
 
   const system = mode === 'train' ? TRAIN_SYSTEM : DISCOVER_SYSTEM
   const tools = mode === 'train' ? TRAIN_TOOLS : DISCOVER_TOOLS
+  const staged: StagedFile[] = []
+
+  // Build Anthropic messages
+  const apiMessages: Anthropic.MessageParam[] = messages.map((m: { role: string; content: string }) => ({
+    role: m.role as 'user' | 'assistant',
+    content: m.content
+  }))
+
+  // Inject image into last user message if provided
+  if (imageData && apiMessages.length > 0) {
+    const last = apiMessages[apiMessages.length - 1]
+    if (last.role === 'user') {
+      const text = typeof last.content === 'string' ? last.content : ''
+      last.content = [
+        { type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.data } },
+        { type: 'text', text: text || 'Please analyze this image and store it in the vault.' }
+      ] as Anthropic.ContentBlockParam[]
+    }
+  }
 
   const encoder = new TextEncoder()
-  const staged: StagedFile[] = []
 
   const stream = new ReadableStream({
     async start(controller) {
-      const send = (data: object) => {
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`))
+      function send(obj: object) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`))
       }
 
       try {
-        // Build message list — inject image if provided
-        const apiMessages: Anthropic.MessageParam[] = messages.map((m: { role: string; content: string }) => ({
-          role: m.role as 'user' | 'assistant',
-          content: m.content
-        }))
-
-        // Replace last user message content with image + text if image provided
-        if (imageData && apiMessages.length > 0) {
-          const last = apiMessages[apiMessages.length - 1]
-          if (last.role === 'user') {
-            const text = typeof last.content === 'string' ? last.content : ''
-            last.content = [
-              { type: 'image', source: { type: 'base64', media_type: imageData.mediaType, data: imageData.data } },
-              { type: 'text', text: text || 'Please analyze this image and store it appropriately in the vault.' }
-            ] as Anthropic.ContentBlockParam[]
-          }
-        }
-
-        let continueLoop = true
         let loopMessages = [...apiMessages]
+        let iterations = 0
+        const MAX_ITERATIONS = 10
 
-        while (continueLoop) {
+        while (iterations < MAX_ITERATIONS) {
+          iterations++
+
           const response = await client.messages.create({
             model: 'claude-opus-4-5',
             max_tokens: 4096,
@@ -156,38 +215,38 @@ export async function POST(req: NextRequest) {
             messages: loopMessages,
           })
 
-          // Stream text blocks
+          // Stream all text content
           for (const block of response.content) {
-            if (block.type === 'text') {
-              // Stream word by word for responsiveness
-              const words = block.text.split(' ')
-              for (const word of words) {
-                send({ type: 'text', content: word + ' ' })
-              }
-            }
-            if (block.type === 'tool_use') {
-              send({ type: 'tool_call', name: block.name, input: block.input })
-              const result = executeTool(block.name, block.input as Record<string, string>, staged)
-              send({ type: 'tool_result', name: block.name, result })
-
-              // Add assistant message + tool result to continue loop
-              loopMessages = [
-                ...loopMessages,
-                { role: 'assistant', content: response.content },
-                {
-                  role: 'user',
-                  content: [{ type: 'tool_result', tool_use_id: block.id, content: result }]
-                }
-              ]
+            if (block.type === 'text' && block.text) {
+              send({ type: 'text', content: block.text })
             }
           }
 
-          // Stop if no tool use or model says end_turn
-          continueLoop = response.stop_reason === 'tool_use' &&
-            response.content.some(b => b.type === 'tool_use')
+          // Handle tool use
+          const toolUseBlocks = response.content.filter(b => b.type === 'tool_use') as Anthropic.ToolUseBlock[]
+
+          if (toolUseBlocks.length === 0 || response.stop_reason !== 'tool_use') {
+            break
+          }
+
+          // Execute tools and collect results
+          const toolResults: Anthropic.ToolResultBlockParam[] = []
+          for (const block of toolUseBlocks) {
+            send({ type: 'tool_call', name: block.name })
+            const result = await executeTool(block.name, block.input as Record<string, string>, staged)
+            send({ type: 'tool_result', name: block.name, result: result.slice(0, 500) })
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result })
+          }
+
+          // Continue conversation with tool results
+          loopMessages = [
+            ...loopMessages,
+            { role: 'assistant' as const, content: response.content },
+            { role: 'user' as const, content: toolResults }
+          ]
         }
 
-        // Send staged files for confirmation UI
+        // Send staged files for confirmation
         if (staged.length > 0) {
           send({ type: 'staged', files: staged })
         }
@@ -204,7 +263,8 @@ export async function POST(req: NextRequest) {
   return new Response(stream, {
     headers: {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-cache, no-transform',
+      'X-Accel-Buffering': 'no',
       'Connection': 'keep-alive',
     }
   })
