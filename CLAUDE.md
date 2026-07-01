@@ -1,5 +1,13 @@
 # BrainDump — CLAUDE.md
 
+> ⚠️ **ARCHIVED 2026-07-01 — DO NOT DEPLOY.**
+> Superseded by **brain-map** (live at brain.oxfordhub.app), which is a superset:
+> it already provides chat, train/commit, and chat history, plus a graph view,
+> vault browser, intelligence API, and role-based access. Claude Code also now
+> writes to the brain vault directly. The only BrainDump-unique feature was
+> file upload → not carried over. Kept read-only for reference. Do not resurrect
+> or register in the hub.
+
 ## Purpose
 Chat-based interface for interacting with the MTA brain vault. Two modes:
 - **Train Mode**: Teach the brain new facts → Claude AI stages file changes → committed to brain git repo
